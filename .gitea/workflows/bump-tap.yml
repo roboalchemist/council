@@ -26,6 +26,7 @@ jobs:
           git clone https://roboalchemist:${{ secrets.TAP_TOKEN }}@gitea.roboalch.com/roboalchemist/homebrew-private.git
           cd homebrew-private
           sed -i "s|version \\"[^\\"]*\\"|version \\"${VERSION}\\"|" Formula/council.rb
+          sed -i "s|tag: \"[^\"]*\"|tag: \"${TAG}\"|" Formula/council.rb
           sed -i "s|sha256 \\"[0-9a-f]*\\"|sha256 \\"${SHA256}\\"|" Formula/council.rb
           git add Formula/council.rb
           git commit -m "council: bump to ${TAG}"
