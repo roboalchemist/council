@@ -8,26 +8,17 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      - name: Compute tarball sha256
+      - name: Update Homebrew formula
         run: |
           TAG=${{ gitea.event.release.tag_name }}
           VERSION=${TAG#v}
-          TARBALL="https://gitea.roboalch.com/roboalchemist/council/archive/${TAG}.tar.gz"
-          curl -sL "$TARBALL" -H "Authorization: token ${{ secrets.TAP_TOKEN }}" -o release.tgz
-          SHA256=$(sha256sum release.tgz | awk "{print \$1}")
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "SHA256=$SHA256" >> $GITHUB_ENV
-
-      - name: Update Homebrew formula
-        run: |
           git config --global user.name "gitea-actions"
           git config --global user.email "actions@gitea.roboalch.com"
           git clone https://roboalchemist:${{ secrets.TAP_TOKEN }}@gitea.roboalch.com/roboalchemist/homebrew-private.git
           cd homebrew-private
-          sed -i "s|version \\"[^\\"]*\\"|version \\"${VERSION}\\"|" Formula/council.rb
+          sed -i "s|version \"[^\"]*\"|version \"${VERSION}\"|" Formula/council.rb
           sed -i "s|tag: \"[^\"]*\"|tag: \"${TAG}\"|" Formula/council.rb
-          sed -i "s|sha256 \\"[0-9a-f]*\\"|sha256 \\"${SHA256}\\"|" Formula/council.rb
           git add Formula/council.rb
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "council: bump to ${TAG}"
           git push origin master
