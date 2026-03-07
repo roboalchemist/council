@@ -36,7 +36,7 @@ DEFAULT_TOOLS = ["claude", "gemini", "codex"]
 
 # cursor-agent model mappings when substituting for other tools
 CURSOR_AGENT_MODELS = {
-    "claude": "claude-4-opus",
+    "claude": "opus-4.6",
     "gemini": "gemini-3-pro",
     "codex": "gpt-5.2-codex",
 }
@@ -80,7 +80,7 @@ def build_tool_command(
     """
     if use_cursor and name != "cursor-agent":
         model = CURSOR_AGENT_MODELS.get(name, "gemini-3-pro")
-        cmd = ["agent", "--print", "--model", model]
+        cmd = ["agent", "--print", "--trust", "--model", model]
         if mode == "yolo":
             cmd.extend(["--force", "--approve-mcps"])
         elif mode == "read-only":
@@ -117,7 +117,7 @@ def build_tool_command(
             cmd = ["codex", "-s", "read-only", "exec", prompt]
         return cmd
     elif name == "cursor-agent":
-        cmd = ["agent", "--print", "--model", "gemini-3-pro"]
+        cmd = ["agent", "--print", "--trust", "--model", "opus-4.6"]
         if mode == "yolo":
             cmd.extend(["--force", "--approve-mcps"])
         elif mode == "read-only":
