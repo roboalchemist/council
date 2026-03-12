@@ -135,11 +135,17 @@ async def run_tool(name: str, command: list[str], cwd: str, timeout: int = 600) 
     start_time = time.time()
 
     try:
+        # Claude Code blocks nested sessions via CLAUDECODE env var — unset it
+        env = None
+        if name == "claude" and "CLAUDECODE" in os.environ:
+            env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
+            env=env,
         )
 
         stdout, stderr = await asyncio.wait_for(
@@ -439,12 +445,17 @@ def doctor():
         auth_cmd = auth_info.get("auth_cmd")
         if auth_cmd:
             try:
+                # Unset CLAUDECODE so claude can run nested inside another Claude session
+                probe_env = None
+                if tool == "claude" and "CLAUDECODE" in os.environ:
+                    probe_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
                 result = subprocess.run(
                     auth_cmd,
                     capture_output=True,
                     text=True,
                     timeout=15,
                     cwd=os.getcwd(),
+                    env=probe_env,
                 )
                 if result.returncode == 0:
                     click.echo(f"  Auth Test: {click.style('✓ responding', fg='green')}")
