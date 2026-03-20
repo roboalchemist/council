@@ -12,7 +12,7 @@
           "evidence": {"type": "string"},
           "fix": {"type": "string"}
         },
-        "required": ["line", "claim", "verdict"],
+        "required": ["line", "claim", "verdict", "evidence", "fix"],
         "additionalProperties": false
       }
     },
