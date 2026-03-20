@@ -67,6 +67,54 @@ TOOL_AUTH_CHECKS = {
 }
 
 
+def _extract_json_from_text(text: str) -> str:
+    """Extract a JSON object from text that may contain surrounding narrative.
+
+    Handles: pure JSON, ```json fences, and prose before/after JSON.
+    Returns the extracted JSON string, or the original text if extraction fails.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return text
+
+    # Try direct parse first
+    try:
+        json.loads(text)
+        return text
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strip markdown code fences
+    stripped = text.strip()
+    if stripped.startswith("```json"):
+        stripped = stripped.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        try:
+            json.loads(stripped)
+            return stripped
+        except (json.JSONDecodeError, ValueError):
+            pass
+    elif stripped.startswith("```"):
+        stripped = stripped[3:].rsplit("```", 1)[0].strip()
+        try:
+            json.loads(stripped)
+            return stripped
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Find JSON object in surrounding prose: scan for outermost { ... }
+    first_brace = text.find("{")
+    if first_brace >= 0:
+        last_brace = text.rfind("}")
+        if last_brace > first_brace:
+            candidate = text[first_brace:last_brace + 1]
+            try:
+                json.loads(candidate)
+                return candidate
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    return text
+
+
 def _prepend_dirs_to_prompt(prompt: str, add_dirs: list[str] | None) -> str:
     """Prepend additional context directories to a prompt (for tools without native dir support)."""
     if not add_dirs:
@@ -225,14 +273,7 @@ async def run_tool(name: str, command: list[str], cwd: str, timeout: int = 600,
             try:
                 envelope = json.loads(output)
                 if isinstance(envelope, dict) and "result" in envelope:
-                    result_text = envelope["result"]
-                    # Strip markdown code fences if the model wrapped JSON in them
-                    if isinstance(result_text, str):
-                        if result_text.startswith("```json"):
-                            result_text = result_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-                        elif result_text.startswith("```"):
-                            result_text = result_text[3:].rsplit("```", 1)[0].strip()
-                    output = result_text
+                    output = _extract_json_from_text(envelope["result"])
             except (json.JSONDecodeError, ValueError):
                 pass  # Not a valid envelope — use raw output
 
