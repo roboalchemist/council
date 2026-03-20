@@ -123,7 +123,16 @@ def build_tool_command(
             for d in add_dirs:
                 cmd.extend(["--add-dir", d])
         if json_schema:
-            cmd.extend(["--json-schema", json_schema])
+            # Use --output-format json + schema in prompt instead of --json-schema.
+            # --json-schema triggers agent mode which outputs "Done." instead of JSON.
+            # --output-format json wraps the response in a metadata envelope with a
+            # .result field containing the actual model output.
+            cmd.append("--output-format")
+            cmd.append("json")
+            prompt = (
+                f"IMPORTANT: Your FINAL output must be ONLY valid JSON matching this schema "
+                f"(no markdown, no explanation, no code fences):\n{json_schema}\n\n{prompt}"
+            )
         cmd.append(prompt)
         return cmd
     elif name == "gemini":
@@ -201,6 +210,23 @@ async def run_tool(name: str, command: list[str], cwd: str, timeout: int = 600) 
         output = stdout.decode("utf-8", errors="replace").strip()
         error = stderr.decode("utf-8", errors="replace").strip() if stderr else None
 
+        # Claude with --output-format json wraps response in a metadata envelope.
+        # Extract .result field which contains the actual model output.
+        if name == "claude" and "--output-format" in command and output:
+            try:
+                envelope = json.loads(output)
+                if isinstance(envelope, dict) and "result" in envelope:
+                    result_text = envelope["result"]
+                    # Strip markdown code fences if the model wrapped JSON in them
+                    if isinstance(result_text, str):
+                        if result_text.startswith("```json"):
+                            result_text = result_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+                        elif result_text.startswith("```"):
+                            result_text = result_text[3:].rsplit("```", 1)[0].strip()
+                    output = result_text
+            except (json.JSONDecodeError, ValueError):
+                pass  # Not a valid envelope — use raw output
+
         return ToolResult(
             name=name,
             output=output,
@@ -276,8 +302,8 @@ async def post_process_result(result: ToolResult, schema_str: str) -> ToolResult
                 duration=result.duration,
                 success=True,
             )
-    except Exception:
-        pass  # Fall through to return original result
+    except Exception as e:
+        click.echo(f"  haiku post-process failed for {result.name}: {e}", err=True)
 
     return result
 
