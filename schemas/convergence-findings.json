@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "line": {"type": "integer"},
+          "claim": {"type": "string"},
+          "verdict": {"enum": ["ACCURATE", "INACCURATE", "UNVERIFIABLE", "NO_CITATION"]},
+          "evidence": {"type": "string"},
+          "fix": {"type": "string"}
+        },
+        "required": ["line", "claim", "verdict"]
+      }
+    },
+    "clean": {"type": "boolean"}
+  },
+  "required": ["findings", "clean"]
+}
