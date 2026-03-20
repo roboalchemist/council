@@ -8,10 +8,13 @@ alternative viewpoints.
 """
 
 import asyncio
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -63,7 +66,8 @@ TOOL_AUTH_CHECKS = {
 
 
 def build_tool_command(
-    name: str, prompt: str, mode: str = "read-only", use_cursor: bool = False
+    name: str, prompt: str, mode: str = "read-only", use_cursor: bool = False,
+    json_schema: str = None,
 ) -> list[str]:
     """Build command for a specific tool.
 
@@ -78,6 +82,14 @@ def build_tool_command(
         use_cursor: When True, use cursor-agent as a substitute with the
             appropriate model for the requested tool.
     """
+    # Append schema instruction to prompt for tools that don't support native schema
+    if json_schema and name in ("gemini", "cursor-agent") or (json_schema and use_cursor):
+        prompt = (
+            prompt
+            + "\n\nIMPORTANT: Respond ONLY with valid JSON matching this schema:\n"
+            + json_schema
+        )
+
     if use_cursor and name != "cursor-agent":
         model = CURSOR_AGENT_MODELS.get(name, "gemini-3-pro")
         cmd = ["agent", "--print", "--trust", "--model", model]
@@ -94,6 +106,8 @@ def build_tool_command(
         cmd = ["claude", "-p"]
         if mode in ("yolo", "read-only"):
             cmd.append("--dangerously-skip-permissions")
+        if json_schema:
+            cmd.extend(["--json-schema", json_schema])
         cmd.append(prompt)
         return cmd
     elif name == "gemini":
@@ -110,11 +124,18 @@ def build_tool_command(
             return ["gemini", "-m", "gemini-3-pro-preview", "-p", prompt]
     elif name == "codex":
         if mode == "yolo":
-            cmd = ["codex", "-a", "never", "-s", "danger-full-access", "exec", prompt]
+            cmd = ["codex", "-a", "never", "-s", "danger-full-access"]
         elif mode == "read-only":
-            cmd = ["codex", "-a", "never", "-s", "read-only", "exec", prompt]
+            cmd = ["codex", "-a", "never", "-s", "read-only"]
         else:
-            cmd = ["codex", "-s", "read-only", "exec", prompt]
+            cmd = ["codex", "-s", "read-only"]
+        if json_schema:
+            schema_hash = hashlib.md5(json_schema.encode()).hexdigest()[:12]
+            schema_path = f"/tmp/council-schema-{schema_hash}.json"
+            with open(schema_path, "w") as f:
+                f.write(json_schema)
+            cmd.extend(["--output-schema", schema_path])
+        cmd.extend(["exec", prompt])
         return cmd
     elif name == "cursor-agent":
         cmd = ["agent", "--print", "--trust", "--model", "opus-4.6"]
@@ -184,6 +205,59 @@ async def run_tool(name: str, command: list[str], cwd: str, timeout: int = 600) 
         )
 
 
+async def post_process_result(result: ToolResult, schema_str: str) -> ToolResult:
+    """Post-process a tool result to ensure it matches the required JSON schema.
+
+    Tries json.loads first. If the output isn't valid JSON, pipes through
+    claude haiku to extract and restructure into the required format.
+    """
+    if not result.success or not result.output:
+        return result
+
+    # Already valid JSON? Return as-is.
+    try:
+        json.loads(result.output)
+        return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Use haiku to extract JSON from freeform output
+    try:
+        extract_prompt = (
+            f"Extract and restructure this into the required JSON format:\n{result.output}"
+        )
+        cmd = [
+            "claude", "-p", "--model", "haiku", "--json-schema", schema_str,
+            extract_prompt,
+        ]
+
+        # Unset CLAUDECODE env var to allow nested claude invocation
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+        normalized = stdout.decode("utf-8", errors="replace").strip()
+
+        if process.returncode == 0 and normalized:
+            return ToolResult(
+                name=result.name,
+                output=normalized,
+                error=result.error,
+                duration=result.duration,
+                success=True,
+            )
+    except Exception:
+        pass  # Fall through to return original result
+
+    return result
+
+
 def check_tool_availability() -> dict[str, bool]:
     """Check which AI tools are available on the system."""
     availability = {}
@@ -234,6 +308,7 @@ async def run_council(
     show_timing: bool = True,
     mode: str = "read-only",
     use_cursor: bool = False,
+    json_schema: str = None,
 ) -> str:
     """Run the prompt against all specified AI tools in parallel."""
     available = check_tool_availability()
@@ -262,7 +337,7 @@ async def run_council(
         return "Error: No AI tools available. Install claude, gemini, or codex."
 
     commands = {
-        name: build_tool_command(name, prompt, mode=mode, use_cursor=use_cursor)
+        name: build_tool_command(name, prompt, mode=mode, use_cursor=use_cursor, json_schema=json_schema)
         for name in tools_to_run
     }
 
@@ -283,6 +358,19 @@ async def run_council(
     sys.stdout.flush()
 
     results = await asyncio.gather(*tasks)
+
+    # Post-process results for tools without native JSON schema support
+    if json_schema:
+        needs_post_process = {"gemini", "cursor-agent"}
+        if use_cursor:
+            # All tools routed through cursor-agent need post-processing
+            needs_post_process = set(tools_to_run)
+        processed = []
+        for r in results:
+            if r.name in needs_post_process:
+                r = await post_process_result(r, json_schema)
+            processed.append(r)
+        results = processed
 
     return format_output(list(results), show_timing=show_timing, tool_count=len(tasks))
 
@@ -338,7 +426,12 @@ def cli():
     is_flag=True,
     help="Use cursor-agent as backend for all tools (routes to appropriate models).",
 )
-def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cursor):
+@click.option(
+    "--json-schema",
+    default=None,
+    help="JSON schema for structured output. Accepts inline JSON string or path to .json file.",
+)
+def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cursor, json_schema):
     """Ask all AI tools a question and compare their responses.
 
     \b
@@ -365,6 +458,20 @@ def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cu
     if tools:
         tool_list = [t.strip().lower() for t in tools.split(",")]
 
+    # Resolve --json-schema: file path or inline string
+    schema_str = None
+    if json_schema:
+        if json_schema.endswith(".json") and os.path.isfile(json_schema):
+            with open(json_schema) as f:
+                schema_str = f.read().strip()
+        else:
+            schema_str = json_schema
+        # Validate it's valid JSON
+        try:
+            json.loads(schema_str)
+        except (json.JSONDecodeError, ValueError) as e:
+            raise click.UsageError(f"Invalid JSON schema: {e}")
+
     flag_count = sum([yolo, read_only, locked])
     if flag_count > 1:
         raise click.UsageError("Only one of --yolo, --read-only, --locked can be used.")
@@ -379,6 +486,7 @@ def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cu
             show_timing=not no_timing,
             mode=mode,
             use_cursor=use_cursor,
+            json_schema=schema_str,
         )
     )
 
