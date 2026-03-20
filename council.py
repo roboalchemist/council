@@ -16,7 +16,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import click
@@ -331,8 +333,12 @@ async def run_council(
     use_cursor: bool = False,
     add_dirs: list[str] | None = None,
     json_schema: str = None,
-) -> str:
-    """Run the prompt against all specified AI tools in parallel."""
+    raw: bool = False,
+) -> str | list[ToolResult]:
+    """Run the prompt against all specified AI tools in parallel.
+
+    When raw=True, returns list[ToolResult] instead of formatted string.
+    """
     available = check_tool_availability()
 
     if tools is None:
@@ -341,7 +347,8 @@ async def run_council(
     # When using cursor-agent as backend, we only need cursor-agent installed
     if use_cursor:
         if not available.get("cursor-agent"):
-            return "Error: --use-cursor requires cursor-agent (agent) to be installed."
+            msg = "Error: --use-cursor requires cursor-agent (agent) to be installed."
+            return [] if raw else msg
     else:
         # Filter to available tools
         tools = [t for t in tools if available.get(t)]
@@ -356,7 +363,8 @@ async def run_council(
             tools_to_run.append(tool)
 
     if not tools_to_run:
-        return "Error: No AI tools available. Install claude, gemini, or codex."
+        msg = "Error: No AI tools available. Install claude, gemini, or codex."
+        return [] if raw else msg
 
     commands = {
         name: build_tool_command(name, prompt, mode=mode, use_cursor=use_cursor, add_dirs=add_dirs, json_schema=json_schema)
@@ -393,6 +401,9 @@ async def run_council(
                 r = await post_process_result(r, json_schema)
             processed.append(r)
         results = processed
+
+    if raw:
+        return list(results)
 
     return format_output(list(results), show_timing=show_timing, tool_count=len(tasks))
 
@@ -618,6 +629,267 @@ def doctor():
         click.echo(f"cursor-agent: available as --use-cursor backend")
 
 
+DEFAULT_CONVERGE_PROMPT = (
+    "Review the following document for factual accuracy, citations, and correctness. "
+    "For each issue found, provide the line number, the claim, your verdict, evidence, "
+    "and a suggested fix. If everything is clean, set clean=true with an empty findings array.\n\n"
+    "{artifact}"
+)
+
+
+def triage_findings(all_findings: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """Group findings across tools by (line, verdict) and classify agreement.
+
+    Returns (unanimous, majority, minority) lists of finding dicts.
+    """
+    # Collect all individual findings with their source count
+    # Key: (line, verdict) -> list of finding dicts from different tools
+    grouped: dict[tuple, list[dict]] = {}
+    tool_count = len(all_findings)
+
+    for findings_obj in all_findings:
+        for finding in findings_obj.get("findings", []):
+            line = finding.get("line")
+            verdict = finding.get("verdict")
+            if line is None or verdict is None:
+                continue
+            key = (line, verdict)
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(finding)
+
+    unanimous = []
+    majority = []
+    minority = []
+
+    for key, findings_list in grouped.items():
+        count = len(findings_list)
+        # Pick the first finding with a fix as representative
+        representative = findings_list[0]
+        for f in findings_list:
+            if f.get("fix"):
+                representative = f
+                break
+
+        if count >= tool_count and tool_count > 0:
+            unanimous.append(representative)
+        elif count >= 2:
+            majority.append(representative)
+        else:
+            minority.append(representative)
+
+    return unanimous, majority, minority
+
+
+def apply_fixes(fixes: list[dict], artifact_path: str) -> None:
+    """Apply unanimous fixes to the artifact file via line replacement.
+
+    Fixes are applied in reverse line order to preserve line numbers.
+    """
+    path = Path(artifact_path)
+    lines = path.read_text().splitlines(keepends=True)
+
+    # Sort by line number descending to preserve positions
+    sorted_fixes = sorted(fixes, key=lambda f: f.get("line", 0), reverse=True)
+
+    for fix in sorted_fixes:
+        fix_text = fix.get("fix", "")
+        line_num = fix.get("line", 0)
+        if not fix_text or line_num < 1 or line_num > len(lines):
+            continue
+        # Preserve the original line ending
+        original = lines[line_num - 1]
+        ending = "\n" if original.endswith("\n") else ""
+        lines[line_num - 1] = fix_text + ending
+
+    path.write_text("".join(lines))
+
+
+async def run_convergence(
+    artifact: str,
+    prompt_template: str,
+    schema_str: str,
+    max_rounds: int,
+    clean_threshold: int,
+    path: str,
+    tools: Optional[list[str]],
+    timeout: int,
+    mode: str,
+    use_cursor: bool,
+    add_dirs: list[str] | None,
+    log_path: str,
+    dry_run: bool,
+) -> None:
+    """Run the convergence loop: council reviews, triage, fix, repeat."""
+    log_file = Path(log_path)
+
+    def log(msg: str) -> None:
+        click.echo(msg)
+        with log_file.open("a") as f:
+            f.write(msg + "\n")
+
+    log(f"=== Convergence started: {artifact} ===")
+    log(f"max_rounds={max_rounds}, clean_threshold={clean_threshold}, dry_run={dry_run}")
+
+    clean_count = 0
+    for round_num in range(1, max_rounds + 1):
+        log(f"\n--- Round {round_num}/{max_rounds} ---")
+
+        # 1. Read artifact contents
+        artifact_content = Path(artifact).read_text()
+
+        # 2. Format prompt with artifact content
+        formatted_prompt = prompt_template.format(artifact=artifact_content)
+
+        # 3. Run council with raw=True to get ToolResults
+        raw_results = await run_council(
+            formatted_prompt, path, tools, timeout,
+            show_timing=True, mode=mode, use_cursor=use_cursor,
+            json_schema=schema_str, add_dirs=add_dirs, raw=True,
+        )
+
+        # 4. Parse structured findings from each tool result
+        all_findings = []
+        for result in raw_results:
+            if not result.success:
+                log(f"  WARNING: {result.name} failed: {result.error}")
+                continue
+            try:
+                findings = json.loads(result.output)
+                all_findings.append(findings)
+                finding_count = len(findings.get("findings", []))
+                log(f"  {result.name}: {'CLEAN' if findings.get('clean') else f'{finding_count} findings'} ({result.duration:.1f}s)")
+            except json.JSONDecodeError:
+                log(f"  WARNING: {result.name} returned non-JSON, skipping")
+
+        if not all_findings:
+            log(f"[Round {round_num}] No parseable results, skipping")
+            continue
+
+        # 5. Check if all clean
+        if all(f.get("clean", False) for f in all_findings):
+            clean_count += 1
+            log(f"[Round {round_num}] CLEAN (streak: {clean_count}/{clean_threshold})")
+            if clean_count >= clean_threshold:
+                log("STEADY STATE — converged")
+                return
+            continue
+
+        # 6. Reset clean streak, triage findings
+        clean_count = 0
+        unanimous, majority, minority = triage_findings(all_findings)
+
+        # 7. Apply unanimous fixes (or show in dry-run)
+        if unanimous and not dry_run:
+            apply_fixes(unanimous, artifact)
+            log(f"[Round {round_num}] FIXED {len(unanimous)} unanimous issues")
+        elif unanimous and dry_run:
+            log(f"[Round {round_num}] DRY-RUN: would fix {len(unanimous)} unanimous issues")
+            for fix in unanimous:
+                log(f"  L{fix.get('line')}: {fix.get('verdict')} — {fix.get('claim', '')[:80]}")
+
+        log(f"[Round {round_num}] {len(majority)} majority, {len(minority)} minority (noted)")
+
+    if clean_count < clean_threshold:
+        log(f"MAX ROUNDS ({max_rounds}) reached, not converged")
+
+
+@cli.command("converge")
+@click.argument("artifact", type=click.Path(exists=True, dir_okay=False, resolve_path=True))
+@click.option("--prompt", default=None, help="Review prompt template with {artifact} placeholder.")
+@click.option("--prompt-file", type=click.Path(exists=True, resolve_path=True), default=None, help="File containing review prompt template.")
+@click.option(
+    "--schema", "schema_path", default=None,
+    help="JSON schema file path (default: schemas/convergence-findings.json relative to council install dir).",
+)
+@click.option("--schema-file", type=click.Path(exists=True, resolve_path=True), default=None, help="Alias for --schema.")
+@click.option("--max-rounds", default=3, show_default=True, help="Maximum convergence rounds.")
+@click.option("--clean-threshold", default=2, show_default=True, help="Consecutive clean rounds for steady state.")
+@click.option(
+    "--add-dir", multiple=True,
+    type=click.Path(exists=True, file_okay=False, resolve_path=True),
+    help="Additional directory for context (repeatable).",
+)
+@click.option("--tools", "-t", help="Comma-separated list of tools to query.")
+@click.option("--timeout", default=600, show_default=True, help="Timeout in seconds for each tool.")
+@click.option("--yolo", is_flag=True, help="Unrestricted mode.")
+@click.option("--read-only", is_flag=True, help="Read-only mode (default).")
+@click.option("--locked", is_flag=True, help="Most restrictive mode.")
+@click.option("--use-cursor", is_flag=True, help="Use cursor-agent as backend.")
+@click.option("--log", "log_path", default="/tmp/council-convergence.log", show_default=True, help="Convergence worklog path.")
+@click.option("--dry-run", is_flag=True, help="Print what would change without applying.")
+def converge(artifact, prompt, prompt_file, schema_path, schema_file, max_rounds, clean_threshold,
+             add_dir, tools, timeout, yolo, read_only, locked, use_cursor, log_path, dry_run):
+    """Run iterative convergence review on an artifact file.
+
+    \b
+    The council reviews ARTIFACT each round, triages findings by agreement level,
+    applies unanimous fixes, and repeats until convergence or max rounds.
+
+    \b
+    Examples:
+      council converge doc.md
+      council converge --dry-run --max-rounds 5 paper.md
+      council converge --prompt "Check {artifact} for typos" notes.txt
+    """
+    # Resolve prompt template
+    if prompt and prompt_file:
+        raise click.UsageError("Only one of --prompt or --prompt-file can be used.")
+    if prompt_file:
+        prompt_template = Path(prompt_file).read_text()
+    elif prompt:
+        prompt_template = prompt
+    else:
+        prompt_template = DEFAULT_CONVERGE_PROMPT
+
+    if "{artifact}" not in prompt_template:
+        raise click.UsageError("Prompt template must contain {artifact} placeholder.")
+
+    # Resolve schema
+    resolved_schema = schema_file or schema_path
+    if resolved_schema is None:
+        # Default: schemas/convergence-findings.json relative to this file
+        default_schema = Path(__file__).parent / "schemas" / "convergence-findings.json"
+        if default_schema.exists():
+            resolved_schema = str(default_schema)
+        else:
+            raise click.UsageError(f"Default schema not found: {default_schema}")
+
+    schema_str = Path(resolved_schema).read_text().strip()
+    try:
+        json.loads(schema_str)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise click.UsageError(f"Invalid JSON schema: {e}")
+
+    # Mode
+    flag_count = sum([yolo, read_only, locked])
+    if flag_count > 1:
+        raise click.UsageError("Only one of --yolo, --read-only, --locked can be used.")
+    mode = "yolo" if yolo else "locked" if locked else "read-only"
+
+    tool_list = None
+    if tools:
+        tool_list = [t.strip().lower() for t in tools.split(",")]
+
+    path = os.getcwd()
+
+    asyncio.run(run_convergence(
+        artifact=artifact,
+        prompt_template=prompt_template,
+        schema_str=schema_str,
+        max_rounds=max_rounds,
+        clean_threshold=clean_threshold,
+        path=path,
+        tools=tool_list,
+        timeout=timeout,
+        mode=mode,
+        use_cursor=use_cursor,
+        add_dirs=list(add_dir) if add_dir else None,
+        log_path=log_path,
+        dry_run=dry_run,
+    ))
+
+
 @cli.command("add")
 @click.argument("name")
 @click.argument("command", nargs=-1, required=True)
@@ -635,7 +907,7 @@ def add_tool(name, command):
 def main():
     """Entry point that defaults to 'ask' when no subcommand given."""
     if len(sys.argv) > 1 and sys.argv[1] not in [
-        "ask", "list", "add", "doctor", "--help", "-h"
+        "ask", "list", "add", "doctor", "converge", "--help", "-h"
     ]:
         sys.argv.insert(1, "ask")
     elif len(sys.argv) == 1:
