@@ -12,10 +12,12 @@
           "evidence": {"type": "string"},
           "fix": {"type": "string"}
         },
-        "required": ["line", "claim", "verdict"]
+        "required": ["line", "claim", "verdict"],
+        "additionalProperties": false
       }
     },
     "clean": {"type": "boolean"}
   },
-  "required": ["findings", "clean"]
+  "required": ["findings", "clean"],
+  "additionalProperties": false
 }
