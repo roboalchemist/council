@@ -79,8 +79,13 @@ def build_tool_command(
     name: str, prompt: str, mode: str = "read-only", use_cursor: bool = False,
     add_dirs: list[str] | None = None,
     json_schema: str = None,
-) -> list[str]:
+) -> tuple[list[str], str | None]:
     """Build command for a specific tool.
+
+    Returns:
+        (command, stdin_data) tuple. stdin_data is None for most tools,
+        or the prompt string when it must be piped via stdin (e.g. claude
+        with --add-dir misparses long positional prompts).
 
     Args:
         name: Tool name (claude, gemini, codex, cursor-agent).
@@ -113,7 +118,7 @@ def build_tool_command(
             cmd.append("--mode=ask")
         effective_prompt = _prepend_dirs_to_prompt(prompt, add_dirs)
         cmd.append(effective_prompt)
-        return cmd
+        return (cmd, None)
 
     if name == "claude":
         cmd = ["claude", "-p"]
@@ -133,8 +138,9 @@ def build_tool_command(
                 f"IMPORTANT: Your FINAL output must be ONLY valid JSON matching this schema "
                 f"(no markdown, no explanation, no code fences):\n{json_schema}\n\n{prompt}"
             )
-        cmd.append(prompt)
-        return cmd
+        # Always pipe prompt via stdin for claude to avoid shell arg length limits
+        # and --add-dir argument parsing issues with long prompts.
+        return (cmd, prompt)
     elif name == "gemini":
         if mode == "yolo":
             cmd = ["gemini", "-m", "gemini-3-pro-preview", "--yolo"]
@@ -149,7 +155,7 @@ def build_tool_command(
         if add_dirs:
             cmd.extend(["--include-directories", ",".join(add_dirs)])
         cmd.extend(["-p", prompt])
-        return cmd
+        return (cmd, None)
     elif name == "codex":
         if mode == "yolo":
             cmd = ["codex", "-a", "never", "-s", "danger-full-access"]
@@ -168,7 +174,7 @@ def build_tool_command(
                 f.write(json_schema)
             cmd.extend(["--output-schema", schema_path])
         cmd.append(prompt)
-        return cmd
+        return (cmd, None)
     elif name == "cursor-agent":
         cmd = ["agent", "--print", "--trust", "--model", "opus-4.6"]
         if mode == "yolo":
@@ -179,12 +185,13 @@ def build_tool_command(
             cmd.append("--mode=ask")
         effective_prompt = _prepend_dirs_to_prompt(prompt, add_dirs)
         cmd.append(effective_prompt)
-        return cmd
+        return (cmd, None)
     else:
         raise ValueError(f"Unknown tool: {name}")
 
 
-async def run_tool(name: str, command: list[str], cwd: str, timeout: int = 600) -> ToolResult:
+async def run_tool(name: str, command: list[str], cwd: str, timeout: int = 600,
+                   stdin_data: str | None = None) -> ToolResult:
     """Run an AI tool command and capture its output."""
     start_time = time.time()
 
@@ -196,14 +203,16 @@ async def run_tool(name: str, command: list[str], cwd: str, timeout: int = 600) 
 
         process = await asyncio.create_subprocess_exec(
             *command,
+            stdin=asyncio.subprocess.PIPE if stdin_data else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             env=env,
         )
 
+        stdin_bytes = stdin_data.encode("utf-8") if stdin_data else None
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=timeout
+            process.communicate(input=stdin_bytes), timeout=timeout
         )
 
         duration = time.time() - start_time
@@ -393,10 +402,13 @@ async def run_council(
         msg = "Error: No AI tools available. Install claude, gemini, or codex."
         return [] if raw else msg
 
-    commands = {
-        name: build_tool_command(name, prompt, mode=mode, use_cursor=use_cursor, add_dirs=add_dirs, json_schema=json_schema)
-        for name in tools_to_run
-    }
+    commands = {}
+    for name in tools_to_run:
+        cmd, stdin_data = build_tool_command(
+            name, prompt, mode=mode, use_cursor=use_cursor,
+            add_dirs=add_dirs, json_schema=json_schema,
+        )
+        commands[name] = (cmd, stdin_data)
 
     # Label with model info when using cursor substitution
     display_names = {}
@@ -407,7 +419,10 @@ async def run_council(
         else:
             display_names[name] = name
 
-    tasks = [run_tool(name, cmd, cwd=path, timeout=timeout) for name, cmd in commands.items()]
+    tasks = [
+        run_tool(name, cmd, cwd=path, timeout=timeout, stdin_data=stdin_data)
+        for name, (cmd, stdin_data) in commands.items()
+    ]
 
     click.echo(f"Querying {len(tasks)} AI tools in parallel (path: {path})...")
     if use_cursor:
