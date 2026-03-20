@@ -148,6 +148,7 @@ def build_tool_command(
             cmd = ["codex", "-a", "never", "-s", "read-only"]
         else:
             cmd = ["codex", "-s", "read-only"]
+        cmd.append("exec")
         if add_dirs:
             for d in add_dirs:
                 cmd.extend(["--add-dir", d])
@@ -157,7 +158,7 @@ def build_tool_command(
             with open(schema_path, "w") as f:
                 f.write(json_schema)
             cmd.extend(["--output-schema", schema_path])
-        cmd.extend(["exec", prompt])
+        cmd.append(prompt)
         return cmd
     elif name == "cursor-agent":
         cmd = ["agent", "--print", "--trust", "--model", "opus-4.6"]
