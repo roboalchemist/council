@@ -390,16 +390,18 @@ async def run_council(
 
     results = await asyncio.gather(*tasks)
 
-    # Post-process results for tools without native JSON schema support
+    # Post-process results to ensure valid JSON schema compliance
+    # Native tools (claude, codex) should return JSON but may not always,
+    # so post-process ALL tools when json_schema is set
     if json_schema:
-        needs_post_process = {"gemini", "cursor-agent"}
-        if use_cursor:
-            # All tools routed through cursor-agent need post-processing
-            needs_post_process = set(tools_to_run)
         processed = []
         for r in results:
-            if r.name in needs_post_process:
-                r = await post_process_result(r, json_schema)
+            if r.success and r.output:
+                try:
+                    json.loads(r.output)
+                except (json.JSONDecodeError, ValueError):
+                    # Output isn't valid JSON — run through haiku post-processing
+                    r = await post_process_result(r, json_schema)
             processed.append(r)
         results = processed
 
