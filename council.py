@@ -62,8 +62,17 @@ TOOL_AUTH_CHECKS = {
 }
 
 
+def _prepend_dirs_to_prompt(prompt: str, add_dirs: list[str] | None) -> str:
+    """Prepend additional context directories to a prompt (for tools without native dir support)."""
+    if not add_dirs:
+        return prompt
+    dirs_str = ", ".join(add_dirs)
+    return f"Additional context directories: {dirs_str}. Read files from these paths as needed.\n\n{prompt}"
+
+
 def build_tool_command(
-    name: str, prompt: str, mode: str = "read-only", use_cursor: bool = False
+    name: str, prompt: str, mode: str = "read-only", use_cursor: bool = False,
+    add_dirs: list[str] | None = None,
 ) -> list[str]:
     """Build command for a specific tool.
 
@@ -78,6 +87,7 @@ def build_tool_command(
         use_cursor: When True, use cursor-agent as a substitute with the
             appropriate model for the requested tool.
     """
+    # For cursor-agent (native or substitute), prepend dirs to prompt
     if use_cursor and name != "cursor-agent":
         model = CURSOR_AGENT_MODELS.get(name, "gemini-3-pro")
         cmd = ["agent", "--print", "--trust", "--model", model]
@@ -87,34 +97,45 @@ def build_tool_command(
             cmd.extend(["--force", "--approve-mcps", "--mode=ask"])
         else:
             cmd.append("--mode=ask")
-        cmd.append(prompt)
+        effective_prompt = _prepend_dirs_to_prompt(prompt, add_dirs)
+        cmd.append(effective_prompt)
         return cmd
 
     if name == "claude":
         cmd = ["claude", "-p"]
         if mode in ("yolo", "read-only"):
             cmd.append("--dangerously-skip-permissions")
+        if add_dirs:
+            for d in add_dirs:
+                cmd.extend(["--add-dir", d])
         cmd.append(prompt)
         return cmd
     elif name == "gemini":
         if mode == "yolo":
-            return ["gemini", "-m", "gemini-3-pro-preview", "--yolo", "-p", prompt]
+            cmd = ["gemini", "-m", "gemini-3-pro-preview", "--yolo"]
         elif mode == "read-only":
-            return [
+            cmd = [
                 "gemini", "-m", "gemini-3-pro-preview",
                 "--approval-mode", "auto_edit",
                 "--allowed-tools", "ShellTool(gh *)",
-                "-p", prompt,
             ]
         else:
-            return ["gemini", "-m", "gemini-3-pro-preview", "-p", prompt]
+            cmd = ["gemini", "-m", "gemini-3-pro-preview"]
+        if add_dirs:
+            cmd.extend(["--include-directories", ",".join(add_dirs)])
+        cmd.extend(["-p", prompt])
+        return cmd
     elif name == "codex":
         if mode == "yolo":
-            cmd = ["codex", "-a", "never", "-s", "danger-full-access", "exec", prompt]
+            cmd = ["codex", "-a", "never", "-s", "danger-full-access"]
         elif mode == "read-only":
-            cmd = ["codex", "-a", "never", "-s", "read-only", "exec", prompt]
+            cmd = ["codex", "-a", "never", "-s", "read-only"]
         else:
-            cmd = ["codex", "-s", "read-only", "exec", prompt]
+            cmd = ["codex", "-s", "read-only"]
+        if add_dirs:
+            for d in add_dirs:
+                cmd.extend(["--add-dir", d])
+        cmd.extend(["exec", prompt])
         return cmd
     elif name == "cursor-agent":
         cmd = ["agent", "--print", "--trust", "--model", "opus-4.6"]
@@ -124,7 +145,8 @@ def build_tool_command(
             cmd.extend(["--force", "--approve-mcps", "--mode=ask"])
         else:
             cmd.append("--mode=ask")
-        cmd.append(prompt)
+        effective_prompt = _prepend_dirs_to_prompt(prompt, add_dirs)
+        cmd.append(effective_prompt)
         return cmd
     else:
         raise ValueError(f"Unknown tool: {name}")
@@ -234,6 +256,7 @@ async def run_council(
     show_timing: bool = True,
     mode: str = "read-only",
     use_cursor: bool = False,
+    add_dirs: list[str] | None = None,
 ) -> str:
     """Run the prompt against all specified AI tools in parallel."""
     available = check_tool_availability()
@@ -262,7 +285,7 @@ async def run_council(
         return "Error: No AI tools available. Install claude, gemini, or codex."
 
     commands = {
-        name: build_tool_command(name, prompt, mode=mode, use_cursor=use_cursor)
+        name: build_tool_command(name, prompt, mode=mode, use_cursor=use_cursor, add_dirs=add_dirs)
         for name in tools_to_run
     }
 
@@ -338,7 +361,13 @@ def cli():
     is_flag=True,
     help="Use cursor-agent as backend for all tools (routes to appropriate models).",
 )
-def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cursor):
+@click.option(
+    "--add-dir",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, resolve_path=True),
+    help="Additional directory for context (repeatable). Mapped to each tool's native flag.",
+)
+def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cursor, add_dir):
     """Ask all AI tools a question and compare their responses.
 
     \b
@@ -379,6 +408,7 @@ def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cu
             show_timing=not no_timing,
             mode=mode,
             use_cursor=use_cursor,
+            add_dirs=list(add_dir) if add_dir else None,
         )
     )
 
