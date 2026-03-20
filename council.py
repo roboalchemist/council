@@ -779,11 +779,17 @@ async def run_convergence(
     for round_num in range(1, max_rounds + 1):
         log(f"\n--- Round {round_num}/{max_rounds} ---")
 
-        # 1. Read artifact contents
-        artifact_content = Path(artifact).read_text()
+        # 1. Prepare artifact reference for prompt
+        # In yolo/read-only mode, tools can read files directly — pass the path
+        # instead of inlining 80KB+ content that breaks stdin-based tools.
+        artifact_path = str(Path(artifact).resolve())
+        if mode in ("yolo", "read-only"):
+            artifact_ref = f"[File: {artifact_path} — read it from disk]"
+        else:
+            artifact_ref = Path(artifact).read_text()
 
-        # 2. Format prompt with artifact content
-        formatted_prompt = prompt_template.format(artifact=artifact_content)
+        # 2. Format prompt with artifact reference
+        formatted_prompt = prompt_template.format(artifact=artifact_ref)
 
         # 3. Run council with raw=True to get ToolResults
         raw_results = await run_council(
