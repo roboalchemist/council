@@ -206,11 +206,11 @@ def build_tool_command(
         return (cmd, None)
     elif name == "codex":
         if mode == "yolo":
-            cmd = ["codex", "-a", "never", "-s", "danger-full-access"]
+            cmd = ["codex", "-a", "never", "-s", "danger-full-access", "--skip-git-repo-check"]
         elif mode == "read-only":
-            cmd = ["codex", "-a", "never", "-s", "read-only"]
+            cmd = ["codex", "-a", "never", "-s", "read-only", "--skip-git-repo-check"]
         else:
-            cmd = ["codex", "-s", "read-only"]
+            cmd = ["codex", "-s", "read-only", "--skip-git-repo-check"]
         cmd.append("exec")
         if add_dirs:
             for d in add_dirs:
@@ -276,6 +276,10 @@ async def run_tool(name: str, command: list[str], cwd: str, timeout: int = 600,
                     output = _extract_json_from_text(envelope["result"])
             except (json.JSONDecodeError, ValueError):
                 pass  # Not a valid envelope — use raw output
+
+        # Gemini wraps JSON in markdown fences or adds prose — strip it.
+        if name == "gemini" and output:
+            output = _extract_json_from_text(output)
 
         return ToolResult(
             name=name,
