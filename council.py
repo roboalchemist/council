@@ -206,12 +206,12 @@ def build_tool_command(
         return (cmd, None)
     elif name == "codex":
         if mode == "yolo":
-            cmd = ["codex", "-a", "never", "-s", "danger-full-access", "--skip-git-repo-check"]
+            cmd = ["codex", "-a", "never", "-s", "danger-full-access"]
         elif mode == "read-only":
-            cmd = ["codex", "-a", "never", "-s", "read-only", "--skip-git-repo-check"]
+            cmd = ["codex", "-a", "never", "-s", "read-only"]
         else:
-            cmd = ["codex", "-s", "read-only", "--skip-git-repo-check"]
-        cmd.append("exec")
+            cmd = ["codex", "-s", "read-only"]
+        cmd.extend(["exec", "--skip-git-repo-check"])
         if add_dirs:
             for d in add_dirs:
                 cmd.extend(["--add-dir", d])
