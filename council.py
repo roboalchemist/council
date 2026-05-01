@@ -249,9 +249,18 @@ async def run_tool(name: str, command: list[str], cwd: str, timeout: int = 600,
         if name == "claude" and "CLAUDECODE" in os.environ:
             env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
+        # Default to DEVNULL rather than inheriting the parent's stdin. When
+        # council runs under Claude Code (or any orchestrator that puts its
+        # own stdin in non-blocking mode), an inherited stdin makes codex
+        # exec attempt a non-blocking read and fail with EAGAIN
+        # ("Resource temporarily unavailable"). DEVNULL gives the child a
+        # properly-closed stdin so it falls back to the prompt argument.
+        stdin = (
+            asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL
+        )
         process = await asyncio.create_subprocess_exec(
             *command,
-            stdin=asyncio.subprocess.PIPE if stdin_data else None,
+            stdin=stdin,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
