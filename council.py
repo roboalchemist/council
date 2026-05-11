@@ -191,15 +191,17 @@ def build_tool_command(
         if add_dirs:
             for d in add_dirs:
                 cmd.extend(["--add-dir", d])
-        # Expose image directories so Claude's Read tool can access them
+        # Expose image directories so Claude's Read tool can access them.
+        # Resolve symlinks so the --add-dir path matches reality (e.g. /tmp → /private/tmp).
         if images:
+            resolved_images = [str(Path(img).resolve()) for img in images]
             seen_dirs: set[str] = set(add_dirs or [])
-            for img in images:
+            for img in resolved_images:
                 img_dir = str(Path(img).parent)
                 if img_dir not in seen_dirs:
                     cmd.extend(["--add-dir", img_dir])
                     seen_dirs.add(img_dir)
-            prompt = _prepend_images_to_prompt(prompt, images)
+            prompt = _prepend_images_to_prompt(prompt, resolved_images)
         if json_schema:
             # Use --output-format json + schema in prompt instead of --json-schema.
             # --json-schema triggers agent mode which outputs "Done." instead of JSON.
@@ -218,17 +220,30 @@ def build_tool_command(
         if mode == "yolo":
             cmd = ["gemini", "-m", "gemini-3-pro-preview", "--yolo"]
         elif mode == "read-only":
+            # When images are present, allow ShellTool broadly so Gemini can
+            # read files from image directories (not just gh commands).
+            allowed = "ShellTool(*)" if images else "ShellTool(gh *)"
             cmd = [
                 "gemini", "-m", "gemini-3-pro-preview",
                 "--approval-mode", "auto_edit",
-                "--allowed-tools", "ShellTool(gh *)",
+                "--allowed-tools", allowed,
             ]
         else:
             cmd = ["gemini", "-m", "gemini-3-pro-preview"]
-        if add_dirs:
-            cmd.extend(["--include-directories", ",".join(add_dirs)])
+        # Include image parent directories so Gemini's workspace includes them.
+        # Resolve symlinks (e.g. /tmp → /private/tmp on macOS) so the dir
+        # Gemini enforces matches the dir we actually include.
+        all_dirs = list(add_dirs or [])
         if images:
-            prompt = _prepend_images_to_prompt(prompt, images)
+            for img in images:
+                img_dir = str(Path(img).resolve().parent)
+                if img_dir not in all_dirs:
+                    all_dirs.append(img_dir)
+        if all_dirs:
+            cmd.extend(["--include-directories", ",".join(all_dirs)])
+        if images:
+            resolved_images = [str(Path(img).resolve()) for img in images]
+            prompt = _prepend_images_to_prompt(prompt, resolved_images)
         cmd.extend(["-p", prompt])
         return (cmd, None)
     elif name == "codex":
@@ -238,11 +253,12 @@ def build_tool_command(
             cmd = ["codex", "-a", "never", "-s", "read-only"]
         else:
             cmd = ["codex", "-s", "read-only"]
-        # Codex native image flag: must come before 'exec'
+        cmd.extend(["exec", "--skip-git-repo-check"])
+        # Codex -i flag belongs on the 'exec' subcommand, not the top-level command.
+        # Resolve symlinks so paths are canonical (e.g. /tmp → /private/tmp on macOS).
         if images:
             for img in images:
-                cmd.extend(["-i", img])
-        cmd.extend(["exec", "--skip-git-repo-check"])
+                cmd.extend(["-i", str(Path(img).resolve())])
         if add_dirs:
             for d in add_dirs:
                 cmd.extend(["--add-dir", d])
