@@ -268,6 +268,10 @@ def build_tool_command(
             with open(schema_path, "w") as f:
                 f.write(json_schema)
             cmd.extend(["--output-schema", schema_path])
+        # When -i is used, codex reads the prompt from stdin (not positional arg).
+        # Otherwise, pass the prompt as the final positional argument.
+        if images:
+            return (cmd, prompt)
         cmd.append(prompt)
         return (cmd, None)
     elif name == "cursor-agent":
