@@ -123,10 +123,23 @@ def _prepend_dirs_to_prompt(prompt: str, add_dirs: list[str] | None) -> str:
     return f"Additional context directories: {dirs_str}. Read files from these paths as needed.\n\n{prompt}"
 
 
+def _prepend_images_to_prompt(prompt: str, images: list[str] | None) -> str:
+    """Prepend image path instructions to a prompt for tools without native image flags."""
+    if not images:
+        return prompt
+    paths = "\n".join(f"  - {p}" for p in images)
+    return (
+        f"The following image file(s) are available for you to view — use your Read tool "
+        f"(or equivalent file-reading capability) to open each one and examine it visually "
+        f"before answering:\n{paths}\n\n{prompt}"
+    )
+
+
 def build_tool_command(
     name: str, prompt: str, mode: str = "read-only", use_cursor: bool = False,
     add_dirs: list[str] | None = None,
     json_schema: str = None,
+    images: list[str] | None = None,
 ) -> tuple[list[str], str | None]:
     """Build command for a specific tool.
 
@@ -145,6 +158,9 @@ def build_tool_command(
             - "yolo": Unrestricted. Can read, write, execute anything.
         use_cursor: When True, use cursor-agent as a substitute with the
             appropriate model for the requested tool.
+        images: Optional list of absolute image file paths to attach/reference.
+            Codex uses its native -i flag; Claude/Gemini receive path instructions
+            in the prompt so they can open and view the files.
     """
     # Append schema instruction to prompt for tools that don't support native schema
     if json_schema and name in ("gemini", "cursor-agent") or (json_schema and use_cursor):
@@ -164,7 +180,7 @@ def build_tool_command(
             cmd.extend(["--force", "--approve-mcps", "--mode=ask"])
         else:
             cmd.append("--mode=ask")
-        effective_prompt = _prepend_dirs_to_prompt(prompt, add_dirs)
+        effective_prompt = _prepend_dirs_to_prompt(_prepend_images_to_prompt(prompt, images), add_dirs)
         cmd.append(effective_prompt)
         return (cmd, None)
 
@@ -175,6 +191,15 @@ def build_tool_command(
         if add_dirs:
             for d in add_dirs:
                 cmd.extend(["--add-dir", d])
+        # Expose image directories so Claude's Read tool can access them
+        if images:
+            seen_dirs: set[str] = set(add_dirs or [])
+            for img in images:
+                img_dir = str(Path(img).parent)
+                if img_dir not in seen_dirs:
+                    cmd.extend(["--add-dir", img_dir])
+                    seen_dirs.add(img_dir)
+            prompt = _prepend_images_to_prompt(prompt, images)
         if json_schema:
             # Use --output-format json + schema in prompt instead of --json-schema.
             # --json-schema triggers agent mode which outputs "Done." instead of JSON.
@@ -202,6 +227,8 @@ def build_tool_command(
             cmd = ["gemini", "-m", "gemini-3-pro-preview"]
         if add_dirs:
             cmd.extend(["--include-directories", ",".join(add_dirs)])
+        if images:
+            prompt = _prepend_images_to_prompt(prompt, images)
         cmd.extend(["-p", prompt])
         return (cmd, None)
     elif name == "codex":
@@ -211,6 +238,10 @@ def build_tool_command(
             cmd = ["codex", "-a", "never", "-s", "read-only"]
         else:
             cmd = ["codex", "-s", "read-only"]
+        # Codex native image flag: must come before 'exec'
+        if images:
+            for img in images:
+                cmd.extend(["-i", img])
         cmd.extend(["exec", "--skip-git-repo-check"])
         if add_dirs:
             for d in add_dirs:
@@ -231,7 +262,7 @@ def build_tool_command(
             cmd.extend(["--force", "--approve-mcps", "--mode=ask"])
         else:
             cmd.append("--mode=ask")
-        effective_prompt = _prepend_dirs_to_prompt(prompt, add_dirs)
+        effective_prompt = _prepend_dirs_to_prompt(_prepend_images_to_prompt(prompt, images), add_dirs)
         cmd.append(effective_prompt)
         return (cmd, None)
     else:
@@ -423,6 +454,7 @@ async def run_council(
     use_cursor: bool = False,
     add_dirs: list[str] | None = None,
     json_schema: str = None,
+    images: list[str] | None = None,
     raw: bool = False,
 ) -> str | list[ToolResult]:
     """Run the prompt against all specified AI tools in parallel.
@@ -460,7 +492,7 @@ async def run_council(
     for name in tools_to_run:
         cmd, stdin_data = build_tool_command(
             name, prompt, mode=mode, use_cursor=use_cursor,
-            add_dirs=add_dirs, json_schema=json_schema,
+            add_dirs=add_dirs, json_schema=json_schema, images=images,
         )
         commands[name] = (cmd, stdin_data)
 
@@ -568,7 +600,13 @@ def cli():
     default=None,
     help="JSON schema for structured output. Accepts inline JSON string or path to .json file.",
 )
-def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cursor, add_dir, json_schema):
+@click.option(
+    "--image",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+    help="Image file to attach for visual evaluation (repeatable). Codex uses native -i flag; Claude/Gemini receive path instructions.",
+)
+def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cursor, add_dir, json_schema, image):
     """Ask all AI tools a question and compare their responses.
 
     \b
@@ -625,6 +663,7 @@ def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cu
             use_cursor=use_cursor,
             add_dirs=list(add_dir) if add_dir else None,
             json_schema=schema_str,
+            images=list(image) if image else None,
         )
     )
 
