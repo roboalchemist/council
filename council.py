@@ -220,19 +220,17 @@ def build_tool_command(
         if mode == "yolo":
             cmd = ["gemini", "-m", "gemini-3-pro-preview", "--yolo"]
         elif mode == "read-only":
-            # When images are present, allow ShellTool broadly so Gemini can
-            # read files from image directories (not just gh commands).
-            allowed = "ShellTool(*)" if images else "ShellTool(gh *)"
             cmd = [
                 "gemini", "-m", "gemini-3-pro-preview",
                 "--approval-mode", "auto_edit",
-                "--allowed-tools", allowed,
+                "--allowed-tools", "ShellTool(gh *)",
             ]
         else:
             cmd = ["gemini", "-m", "gemini-3-pro-preview"]
-        # Include image parent directories so Gemini's workspace includes them.
-        # Resolve symlinks (e.g. /tmp → /private/tmp on macOS) so the dir
-        # Gemini enforces matches the dir we actually include.
+        # Build include-directories: user dirs + image parent dirs.
+        # Gemini enforces workspace restrictions on @-references, so image
+        # parent dirs must be explicitly included. Resolve symlinks first
+        # (/tmp → /private/tmp on macOS) so the path Gemini checks matches.
         all_dirs = list(add_dirs or [])
         if images:
             for img in images:
@@ -242,8 +240,11 @@ def build_tool_command(
         if all_dirs:
             cmd.extend(["--include-directories", ",".join(all_dirs)])
         if images:
-            resolved_images = [str(Path(img).resolve()) for img in images]
-            prompt = _prepend_images_to_prompt(prompt, resolved_images)
+            # Native mechanism: @/resolved/path tokens in the prompt cause
+            # handleAtCommand() to base64-encode the file as inlineData for
+            # the Gemini API, bypassing ShellTool entirely.
+            at_refs = " ".join(f"@{Path(img).resolve()}" for img in images)
+            prompt = f"{at_refs}\n\n{prompt}"
         cmd.extend(["-p", prompt])
         return (cmd, None)
     elif name == "codex":
