@@ -43,9 +43,9 @@ DEFAULT_TOOLS = ["claude", "gemini", "codex"]
 # Default model for each tool. None = use the tool's own built-in default.
 # Override per-invocation with --MODEL-model flags or ~/.council.toml.
 DEFAULT_MODELS: dict[str, str | None] = {
-    "claude": None,
+    "claude": "claude-opus-4-7",
     "gemini": "gemini-3-pro-preview",
-    "codex": None,
+    "codex": "gpt-5.5",
     "cursor-agent": "claude-opus-4-7-high",
 }
 
