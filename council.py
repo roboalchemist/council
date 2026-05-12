@@ -46,14 +46,14 @@ DEFAULT_MODELS: dict[str, str | None] = {
     "claude": None,
     "gemini": "gemini-3-pro-preview",
     "codex": None,
-    "cursor-agent": "opus-4.6",
+    "cursor-agent": "claude-opus-4-7-high",
 }
 
 # cursor-agent model mappings when --use-cursor substitutes for other tools
 DEFAULT_CURSOR_MODELS: dict[str, str] = {
-    "claude": "opus-4.6",
-    "gemini": "gemini-3-pro",
-    "codex": "gpt-5.2-codex",
+    "claude": "claude-opus-4-7-high",
+    "gemini": "gemini-3.1-pro",
+    "codex": "gpt-5.3-codex",
 }
 
 # Environment variables to check for auth per tool
