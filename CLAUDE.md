@@ -33,12 +33,14 @@ Single-file async Python app. Entry point: `main()` → `cli()` (Click group).
 
 ### Tools supported
 
-| Name | Binary | Model | Notes |
-|------|--------|-------|-------|
-| `claude` | `claude` | default | Prompt via stdin; uses `--output-format json` for schema mode |
+| Name | Binary | Default model | Notes |
+|------|--------|--------------|-------|
+| `claude` | `claude` | (claude's own default) | Prompt via stdin; uses `--output-format json` for schema mode |
 | `gemini` | `gemini` | `gemini-3-pro-preview` | Prompt via `-p` arg |
-| `codex` | `codex` | default | Prompt via positional arg; schema via `--output-schema` tempfile |
+| `codex` | `codex` | (codex's own default) | Prompt via positional arg; schema via `--output-schema` tempfile |
 | `cursor-agent` | `agent` | `opus-4.6` | Optional; also acts as substitute backend via `--use-cursor` |
+
+Override defaults with `--MODEL-model` flags or `~/.council.toml` (see [Model selection](#model-selection)).
 
 ### Permission modes
 
@@ -51,6 +53,34 @@ Single-file async Python app. Entry point: `main()` → `cli()` (Click group).
 ### Parallelism
 
 `asyncio.create_subprocess_exec` — all tools run simultaneously. Results gathered via `asyncio.gather`.
+
+## Model selection
+
+Models change frequently. Override per-invocation with flags, or set persistent defaults in `~/.council.toml`.
+
+### CLI flags
+
+```bash
+council --gemini-model gemini-3.1-pro "review this"
+council --claude-model claude-opus-4-7 --codex-model gpt-5.5-pro "review this"
+```
+
+Available on both `ask` and `converge`. When a model is overridden, its name appears in the output header: `## GEMINI [gemini-3.1-pro] ✓ (33s)`.
+
+### Config file (`~/.council.toml`)
+
+```toml
+# ~/.council.toml — persistent defaults, overridden by CLI flags
+[models]
+claude       = "claude-opus-4-7"
+gemini       = "gemini-3.1-pro"
+codex        = "gpt-5.5-pro"
+cursor-agent = "opus-4.7"
+```
+
+Priority: CLI flag > `~/.council.toml` > hardcoded default (`DEFAULT_MODELS` in `council.py`).
+
+`tomllib` (Python 3.11+ stdlib) is used for parsing — no new dependencies.
 
 ## Key implementation details
 

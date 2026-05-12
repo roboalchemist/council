@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,8 +40,17 @@ class ToolResult:
 TOOL_NAMES = ["claude", "gemini", "codex", "cursor-agent"]
 DEFAULT_TOOLS = ["claude", "gemini", "codex"]
 
-# cursor-agent model mappings when substituting for other tools
-CURSOR_AGENT_MODELS = {
+# Default model for each tool. None = use the tool's own built-in default.
+# Override per-invocation with --MODEL-model flags or ~/.council.toml.
+DEFAULT_MODELS: dict[str, str | None] = {
+    "claude": None,
+    "gemini": "gemini-3-pro-preview",
+    "codex": None,
+    "cursor-agent": "opus-4.6",
+}
+
+# cursor-agent model mappings when --use-cursor substitutes for other tools
+DEFAULT_CURSOR_MODELS: dict[str, str] = {
     "claude": "opus-4.6",
     "gemini": "gemini-3-pro",
     "codex": "gpt-5.2-codex",
@@ -140,6 +150,7 @@ def build_tool_command(
     add_dirs: list[str] | None = None,
     json_schema: str = None,
     images: list[str] | None = None,
+    models: dict[str, str] | None = None,
 ) -> tuple[list[str], str | None]:
     """Build command for a specific tool.
 
@@ -161,7 +172,23 @@ def build_tool_command(
         images: Optional list of absolute image file paths to attach/reference.
             Codex uses its native -i flag; Claude/Gemini receive path instructions
             in the prompt so they can open and view the files.
+        models: Optional per-tool model overrides. Keys are tool names; values
+            are model strings. Overrides DEFAULT_MODELS and DEFAULT_CURSOR_MODELS.
     """
+    _models = models or {}
+
+    def _resolve_model(tool: str) -> str | None:
+        """Return the effective model for a tool (override > default)."""
+        return _models.get(tool) or DEFAULT_MODELS.get(tool)
+
+    def _resolve_cursor_model(tool: str) -> str:
+        """Return the cursor-agent model to use for a given tool slot."""
+        # A cursor-agent override applies to all slots; otherwise use per-tool mapping.
+        cursor_override = _models.get("cursor-agent")
+        if cursor_override:
+            return cursor_override
+        return _models.get(tool) or DEFAULT_CURSOR_MODELS.get(tool, "opus-4.6")
+
     # Append schema instruction to prompt for tools that don't support native schema
     if json_schema and name in ("gemini", "cursor-agent") or (json_schema and use_cursor):
         prompt = (
@@ -172,7 +199,7 @@ def build_tool_command(
 
     # For cursor-agent (native or substitute), prepend dirs to prompt
     if use_cursor and name != "cursor-agent":
-        model = CURSOR_AGENT_MODELS.get(name, "gemini-3-pro")
+        model = _resolve_cursor_model(name)
         cmd = ["agent", "--print", "--trust", "--model", model]
         if mode == "yolo":
             cmd.extend(["--force", "--approve-mcps"])
@@ -186,6 +213,9 @@ def build_tool_command(
 
     if name == "claude":
         cmd = ["claude", "-p"]
+        claude_model = _resolve_model("claude")
+        if claude_model:
+            cmd.extend(["--model", claude_model])
         if mode in ("yolo", "read-only"):
             cmd.append("--dangerously-skip-permissions")
         if add_dirs:
@@ -217,16 +247,17 @@ def build_tool_command(
         # and --add-dir argument parsing issues with long prompts.
         return (cmd, prompt)
     elif name == "gemini":
+        gemini_model = _resolve_model("gemini") or "gemini-3-pro-preview"
         if mode == "yolo":
-            cmd = ["gemini", "-m", "gemini-3-pro-preview", "--yolo"]
+            cmd = ["gemini", "-m", gemini_model, "--yolo"]
         elif mode == "read-only":
             cmd = [
-                "gemini", "-m", "gemini-3-pro-preview",
+                "gemini", "-m", gemini_model,
                 "--approval-mode", "auto_edit",
                 "--allowed-tools", "ShellTool(gh *)",
             ]
         else:
-            cmd = ["gemini", "-m", "gemini-3-pro-preview"]
+            cmd = ["gemini", "-m", gemini_model]
         # Build include-directories: user dirs + image parent dirs.
         # Gemini enforces workspace restrictions on @-references, so image
         # parent dirs must be explicitly included. Resolve symlinks first
@@ -248,12 +279,15 @@ def build_tool_command(
         cmd.extend(["-p", prompt])
         return (cmd, None)
     elif name == "codex":
+        codex_model = _resolve_model("codex")
         if mode == "yolo":
             cmd = ["codex", "-a", "never", "-s", "danger-full-access"]
         elif mode == "read-only":
             cmd = ["codex", "-a", "never", "-s", "read-only"]
         else:
             cmd = ["codex", "-s", "read-only"]
+        if codex_model:
+            cmd.extend(["-m", codex_model])
         cmd.extend(["exec", "--skip-git-repo-check"])
         # Codex -i flag belongs on the 'exec' subcommand, not the top-level command.
         # Resolve symlinks so paths are canonical (e.g. /tmp → /private/tmp on macOS).
@@ -276,7 +310,8 @@ def build_tool_command(
         cmd.append(prompt)
         return (cmd, None)
     elif name == "cursor-agent":
-        cmd = ["agent", "--print", "--trust", "--model", "opus-4.6"]
+        cursor_model = _resolve_model("cursor-agent") or "opus-4.6"
+        cmd = ["agent", "--print", "--trust", "--model", cursor_model]
         if mode == "yolo":
             cmd.extend(["--force", "--approve-mcps"])
         elif mode == "read-only":
@@ -432,7 +467,8 @@ def check_tool_availability() -> dict[str, bool]:
     return availability
 
 
-def format_output(results: list[ToolResult], show_timing: bool = True, tool_count: int = 0) -> str:
+def format_output(results: list[ToolResult], show_timing: bool = True, tool_count: int = 0,
+                  models: dict[str, str] | None = None) -> str:
     """Format the consolidated output from all tools."""
     separator = "=" * 80
     lines = []
@@ -445,7 +481,11 @@ def format_output(results: list[ToolResult], show_timing: bool = True, tool_coun
     for result in results:
         status = "✓" if result.success else "✗"
         timing = f" ({result.duration:.1f}s)" if show_timing else ""
-        lines.append(f"## {result.name.upper()} {status}{timing}")
+        # Show model annotation only when it was explicitly overridden
+        model_ann = ""
+        if models and result.name in models:
+            model_ann = f" [{models[result.name]}]"
+        lines.append(f"## {result.name.upper()}{model_ann} {status}{timing}")
         lines.append("-" * 40)
 
         if result.success and result.output:
@@ -476,6 +516,7 @@ async def run_council(
     add_dirs: list[str] | None = None,
     json_schema: str = None,
     images: list[str] | None = None,
+    models: dict[str, str] | None = None,
     raw: bool = False,
 ) -> str | list[ToolResult]:
     """Run the prompt against all specified AI tools in parallel.
@@ -514,14 +555,16 @@ async def run_council(
         cmd, stdin_data = build_tool_command(
             name, prompt, mode=mode, use_cursor=use_cursor,
             add_dirs=add_dirs, json_schema=json_schema, images=images,
+            models=models,
         )
         commands[name] = (cmd, stdin_data)
 
     # Label with model info when using cursor substitution
+    _cursor_models = {**DEFAULT_CURSOR_MODELS, **(models or {})}
     display_names = {}
     for name in tools_to_run:
         if use_cursor and name != "cursor-agent":
-            model = CURSOR_AGENT_MODELS.get(name, "unknown")
+            model = _cursor_models.get(name, "unknown")
             display_names[name] = f"{name} (via cursor-agent/{model})"
         else:
             display_names[name] = name
@@ -556,7 +599,28 @@ async def run_council(
     if raw:
         return list(results)
 
-    return format_output(list(results), show_timing=show_timing, tool_count=len(tasks))
+    return format_output(list(results), show_timing=show_timing, tool_count=len(tasks), models=models)
+
+
+def load_config() -> dict:
+    """Load ~/.council.toml if it exists; return empty dict otherwise.
+
+    Config format:
+        [models]
+        claude       = "claude-opus-4-7"
+        gemini       = "gemini-3.1-pro"
+        codex        = "gpt-5.5-pro"
+        cursor-agent = "opus-4.7"
+    """
+    path = Path.home() / ".council.toml"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except Exception as e:
+        click.echo(f"Warning: could not parse ~/.council.toml: {e}", err=True)
+        return {}
 
 
 @click.group()
@@ -627,7 +691,12 @@ def cli():
     type=click.Path(exists=True, dir_okay=False, resolve_path=True),
     help="Image file to attach for visual evaluation (repeatable). Codex uses native -i flag; Claude/Gemini receive path instructions.",
 )
-def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cursor, add_dir, json_schema, image):
+@click.option("--claude-model", default=None, help="Model for claude (e.g. claude-opus-4-7). Overrides ~/.council.toml and default.")
+@click.option("--gemini-model", default=None, help="Model for gemini (e.g. gemini-3.1-pro). Overrides ~/.council.toml and default.")
+@click.option("--codex-model",  default=None, help="Model for codex (e.g. gpt-5.5-pro). Overrides ~/.council.toml and default.")
+@click.option("--cursor-model", default=None, help="Model for cursor-agent (e.g. opus-4.7). Overrides ~/.council.toml and default.")
+def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cursor, add_dir, json_schema, image,
+        claude_model, gemini_model, codex_model, cursor_model):
     """Ask all AI tools a question and compare their responses.
 
     \b
@@ -673,6 +742,13 @@ def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cu
         raise click.UsageError("Only one of --yolo, --read-only, --locked can be used.")
     mode = "yolo" if yolo else "locked" if locked else "read-only"
 
+    cli_models = {k: v for k, v in {
+        "claude": claude_model, "gemini": gemini_model,
+        "codex": codex_model, "cursor-agent": cursor_model,
+    }.items() if v}
+    config = load_config()
+    effective_models = {**config.get("models", {}), **cli_models} or None
+
     result = asyncio.run(
         run_council(
             prompt=prompt,
@@ -685,6 +761,7 @@ def ask(prompt, path, tools, timeout, no_timing, yolo, read_only, locked, use_cu
             add_dirs=list(add_dir) if add_dir else None,
             json_schema=schema_str,
             images=list(image) if image else None,
+            models=effective_models,
         )
     )
 
@@ -877,6 +954,7 @@ async def run_convergence(
     add_dirs: list[str] | None,
     log_path: str,
     dry_run: bool,
+    models: dict[str, str] | None = None,
 ) -> None:
     """Run the convergence loop: council reviews, triage, fix, repeat."""
     log_file = Path(log_path)
@@ -909,7 +987,7 @@ async def run_convergence(
         raw_results = await run_council(
             formatted_prompt, path, tools, timeout,
             show_timing=True, mode=mode, use_cursor=use_cursor,
-            json_schema=schema_str, add_dirs=add_dirs, raw=True,
+            json_schema=schema_str, add_dirs=add_dirs, models=models, raw=True,
         )
 
         # 4. Parse structured findings from each tool result
@@ -982,8 +1060,13 @@ async def run_convergence(
 @click.option("--use-cursor", is_flag=True, help="Use cursor-agent as backend.")
 @click.option("--log", "log_path", default="/tmp/council-convergence.log", show_default=True, help="Convergence worklog path.")
 @click.option("--dry-run", is_flag=True, help="Print what would change without applying.")
+@click.option("--claude-model", default=None, help="Model for claude (e.g. claude-opus-4-7).")
+@click.option("--gemini-model", default=None, help="Model for gemini (e.g. gemini-3.1-pro).")
+@click.option("--codex-model",  default=None, help="Model for codex (e.g. gpt-5.5-pro).")
+@click.option("--cursor-model", default=None, help="Model for cursor-agent (e.g. opus-4.7).")
 def converge(artifact, prompt, prompt_file, schema_path, schema_file, max_rounds, clean_threshold,
-             add_dir, tools, timeout, yolo, read_only, locked, use_cursor, log_path, dry_run):
+             add_dir, tools, timeout, yolo, read_only, locked, use_cursor, log_path, dry_run,
+             claude_model, gemini_model, codex_model, cursor_model):
     """Run iterative convergence review on an artifact file.
 
     \b
@@ -1037,6 +1120,13 @@ def converge(artifact, prompt, prompt_file, schema_path, schema_file, max_rounds
 
     path = os.getcwd()
 
+    cli_models = {k: v for k, v in {
+        "claude": claude_model, "gemini": gemini_model,
+        "codex": codex_model, "cursor-agent": cursor_model,
+    }.items() if v}
+    config = load_config()
+    effective_models = {**config.get("models", {}), **cli_models} or None
+
     asyncio.run(run_convergence(
         artifact=artifact,
         prompt_template=prompt_template,
@@ -1051,6 +1141,7 @@ def converge(artifact, prompt, prompt_file, schema_path, schema_file, max_rounds
         add_dirs=list(add_dir) if add_dir else None,
         log_path=log_path,
         dry_run=dry_run,
+        models=effective_models,
     ))
 
 
