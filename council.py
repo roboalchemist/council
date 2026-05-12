@@ -53,7 +53,7 @@ DEFAULT_MODELS: dict[str, str | None] = {
 DEFAULT_CURSOR_MODELS: dict[str, str] = {
     "claude": "claude-opus-4-7-high",
     "gemini": "gemini-3.1-pro",
-    "codex": "gpt-5.3-codex",
+    "codex": "gpt-5.5-medium",
 }
 
 # Environment variables to check for auth per tool
